@@ -70,6 +70,7 @@ class Source(BaseModel):
     source: str | None = None
     page: int | None = None
     headings: str | None = None
+    bbox: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -85,6 +86,7 @@ class ChatResponse(BaseModel):
 
 class HistoryResponse(BaseModel):
     thread_id: str
+    summary: str = ""
     messages: list[dict]
 
 
@@ -181,7 +183,8 @@ async def chat(body: ChatRequest) -> ChatResponse:
 
 @app.get("/chat/{thread_id}", response_model=HistoryResponse)
 def chat_history(thread_id: str) -> HistoryResponse:
-    return HistoryResponse(thread_id=thread_id, messages=thread_history(thread_id))
+    payload = thread_history(thread_id)
+    return HistoryResponse(thread_id=thread_id, **payload)
 
 
 if __name__ == "__main__":

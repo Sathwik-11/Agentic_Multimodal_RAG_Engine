@@ -86,16 +86,29 @@ def _flatten_metadata(doc: Document) -> Document:
         flat["filename"] = str(origin["filename"])
 
     pages: list[int] = []
+    bboxes: list[str] = []
     for item in dl_meta.get("doc_items") or []:
         if not isinstance(item, dict):
             continue
         for prov in item.get("prov") or []:
-            if isinstance(prov, dict) and "page_no" in prov:
+            if not isinstance(prov, dict):
+                continue
+            if "page_no" in prov:
                 pages.append(int(prov["page_no"]))
+            box = prov.get("bbox") or {}
+            if isinstance(box, dict) and all(k in box for k in ("l", "t", "r", "b")):
+                page_no = prov.get("page_no", "")
+                bboxes.append(
+                    f"{box['l']},{box['t']},{box['r']},{box['b']},{page_no}"
+                )
     if pages:
         unique_pages = sorted(set(pages))
         flat["page"] = unique_pages[0]
         flat["pages"] = ",".join(str(p) for p in unique_pages)
+    if bboxes:
+        flat["bbox"] = bboxes[0]
+        if len(bboxes) > 1:
+            flat["bboxes"] = "|".join(bboxes[:8])
 
     if "filename" not in flat and source:
         parsed = urlparse(str(source))

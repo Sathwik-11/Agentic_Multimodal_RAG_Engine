@@ -44,7 +44,7 @@ class Settings:
     dense_weight: float = _float("DENSE_WEIGHT", 0.5)
     flashrank_model: str = os.getenv("FLASHRANK_MODEL", "ms-marco-MiniLM-L-12-v2")
     max_retries: int = _int("MAX_RETRIES", 2)
-    max_history_messages: int = _int("MAX_HISTORY_MESSAGES", 20)
+    max_history_exchanges: int = _int("MAX_HISTORY_EXCHANGES", 5)
     tavily_api_key: str = os.getenv("TAVILY_API_KEY", "")
     checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "")
     guardrails_enabled: bool = _bool("GUARDRAILS_ENABLED", True)

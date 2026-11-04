@@ -13,11 +13,13 @@ from pydantic import BaseModel, Field
 class RAGState(TypedDict):
     """Shared graph state for one conversation thread.
 
-    `messages` is the durable chat history (checkpointer + add_messages).
-    The remaining fields are per-turn working memory for retrieval/CRAG.
+    `messages` is the durable chat history (checkpointer + add_messages),
+    compacted to the last five exchanges plus `conversation_summary` for older
+    turns. The remaining fields are per-turn working memory for retrieval/CRAG.
     """
 
     messages: Annotated[list[AnyMessage], add_messages]
+    conversation_summary: str
     question: str
     search_query: str
     documents: list[Document]

@@ -18,7 +18,14 @@ from langgraph.graph import END, START, StateGraph
 from rag.config import settings
 from rag.evaluate import evaluate_turn
 from rag.guardrails import REFUSAL, check_input, check_output
-from rag.prompts import AGENT_SYSTEM, GENERATE_PROMPT, GRADE_PROMPT, REWRITE_PROMPT
+from rag.memory import compact_conversation, conversation_text, llm_history
+from rag.prompts import (
+    AGENT_SYSTEM,
+    GENERATE_PROMPT,
+    GRADE_PROMPT,
+    REWRITE_PROMPT,
+    SUMMARIZE_PROMPT,
+)
 from rag.retriever import retrieve_documents
 from rag.state import RAGState, RetrievalAssessment
 from rag.vectorstore import collection_count, engine_lock
@@ -54,22 +61,10 @@ def _last_human_text(messages: list[BaseMessage]) -> str:
     return ""
 
 
-def _trim(messages: list[BaseMessage]) -> list[BaseMessage]:
-    return messages[-settings.max_history_messages :]
-
-
-def _conversation_text(messages: list[BaseMessage]) -> str:
-    lines: list[str] = []
-    for message in _trim(messages):
-        role = getattr(message, "type", message.__class__.__name__).upper()
-        if role == "TOOL":
-            continue
-        content = message.content
-        if not content:
-            continue
-        text = content if isinstance(content, str) else str(content)
-        lines.append(f"{role}: {text}")
-    return "\n".join(lines) if lines else "(empty)"
+def _summarize_older(previous: str, turns: str) -> str:
+    prompt = SUMMARIZE_PROMPT.format(summary=previous, turns=turns)
+    content = _chat().invoke(prompt).content
+    return content if isinstance(content, str) else str(content)
 
 
 def _format_docs(docs: list[Document]) -> str:
@@ -113,7 +108,7 @@ def _tool_call_ids(message: BaseMessage) -> list[str]:
 
 def prepare(state: RAGState) -> dict:
     question = _last_human_text(state["messages"])
-    return {
+    update = {
         "question": question,
         "search_query": question,
         "documents": [],
@@ -126,6 +121,8 @@ def prepare(state: RAGState) -> dict:
         "guardrails": {},
         "ragas": {},
     }
+    update.update(compact_conversation(state, _summarize_older))
+    return update
 
 
 def input_guard(state: RAGState) -> dict:
@@ -137,7 +134,7 @@ def input_guard(state: RAGState) -> dict:
         }
     return {
         "answer": decision.message,
-        "messages": [AIMessage(content=decision.message)],
+        "messages": [AIMessage(content=decision.message, id=str(uuid4()))],
         "guardrails_blocked": True,
         "guardrails": {"input": "blocked", "output": "skipped"},
         "ragas": {},
@@ -146,7 +143,7 @@ def input_guard(state: RAGState) -> dict:
 
 def agent(state: RAGState) -> dict:
     llm = _chat().bind_tools([retrieve_knowledge])
-    history = _trim(state["messages"])
+    history = llm_history(state)
     response = llm.invoke([("system", AGENT_SYSTEM), *history])
     query = _tool_call_query(response)
     if query:
@@ -178,7 +175,11 @@ def retrieve(state: RAGState) -> dict:
         preview = _format_docs(docs)
         for call_id in _tool_call_ids(last) or [f"retrieve-{uuid4().hex[:8]}"]:
             messages.append(
-                ToolMessage(content=preview[:12000], tool_call_id=call_id)
+                ToolMessage(
+                    content=preview[:12000],
+                    tool_call_id=call_id,
+                    id=str(uuid4()),
+                )
             )
 
     return {
@@ -233,7 +234,7 @@ def rewrite_query(state: RAGState) -> dict:
     prompt = REWRITE_PROMPT.format(
         question=state.get("question", ""),
         search_query=state.get("search_query", ""),
-        conversation=_conversation_text(state["messages"]),
+        conversation=conversation_text(state),
         reason=state.get("retrieval_grade", "incorrect"),
     )
     rewritten = _chat().invoke(prompt).content
@@ -256,12 +257,14 @@ def web_search(state: RAGState) -> dict:
 
 
 def generate(state: RAGState) -> dict:
+    """LLM writes the user-facing answer from the graded retrieved chunks."""
     context_docs = state.get("relevant_documents") or state.get("documents") or []
     prompt = GENERATE_PROMPT.format(
-        conversation=_conversation_text(state["messages"]),
+        conversation=conversation_text(state),
         question=state.get("question", ""),
         context=_format_docs(context_docs),
     )
+    logger.info("Generating answer from %d retrieved chunk(s)", len(context_docs))
     response = _chat(temperature=0).invoke(prompt)
     answer = response.content if isinstance(response.content, str) else str(response.content)
     return {"answer": answer}
@@ -283,7 +286,7 @@ def output_guard(state: RAGState) -> dict:
         blocked = bool(state.get("guardrails_blocked"))
     return {
         "answer": final,
-        "messages": [AIMessage(content=final)] if final else [],
+        "messages": [AIMessage(content=final, id=str(uuid4()))] if final else [],
         "guardrails": payload,
         "guardrails_blocked": blocked,
     }
@@ -309,7 +312,7 @@ def evaluate(state: RAGState) -> dict:
             threshold,
         )
         update["answer"] = REFUSAL
-        update["messages"] = [AIMessage(content=REFUSAL)]
+        update["messages"] = [AIMessage(content=REFUSAL, id=str(uuid4()))]
         payload = dict(state.get("guardrails") or {})
         payload["ragas"] = "blocked"
         update["guardrails"] = payload
@@ -469,6 +472,7 @@ def _source_payload(doc: Document) -> dict:
         "source": doc.metadata.get("source"),
         "page": doc.metadata.get("page"),
         "headings": doc.metadata.get("headings"),
+        "bbox": doc.metadata.get("bbox"),
     }
 
 
@@ -480,7 +484,7 @@ def run_turn(question: str, *, thread_id: str = "default") -> dict:
 
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
-    payload = {"messages": [HumanMessage(content=question)]}
+    payload = {"messages": [HumanMessage(content=question, id=str(uuid4()))]}
     with engine_lock:
         result = graph.invoke(payload, config=config)
 
@@ -497,7 +501,7 @@ def run_turn(question: str, *, thread_id: str = "default") -> dict:
     }
 
 
-def thread_history(thread_id: str) -> list[dict]:
+def thread_history(thread_id: str) -> dict:
     snapshot = get_graph().get_state({"configurable": {"thread_id": thread_id}})
     values = snapshot.values if snapshot else {}
     history: list[dict] = []
@@ -515,7 +519,10 @@ def thread_history(thread_id: str) -> list[dict]:
                 "content": text,
             }
         )
-    return history
+    return {
+        "summary": values.get("conversation_summary") or "",
+        "messages": history,
+    }
 
 
 def ask(
